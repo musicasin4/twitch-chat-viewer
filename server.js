@@ -1,14 +1,13 @@
 const express = require('express');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const PORT = process.env.PORT || 10000;
 const CLIENT_ID = process.env.TWITCH_CLIENT_ID || 'kimne78kx3ncx6brgo4mv6wki5h1ko';
-const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || '';
-let cachedAppToken = { token: '', expiresAt: 0 };
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -25,142 +24,70 @@ async function gql(query) {
   return d.data || {};
 }
 
-async function getAppToken() {
-  if (!CLIENT_SECRET) return '';
-  if (cachedAppToken.token && Date.now() < cachedAppToken.expiresAt - 60000) return cachedAppToken.token;
-  const body = new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'client_credentials' });
-  const r = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body });
-  if (!r.ok) throw new Error(`Twitch OAuth HTTP ${r.status}`);
-  const d = await r.json();
-  cachedAppToken = { token: d.access_token || '', expiresAt: Date.now() + Number(d.expires_in || 0) * 1000 };
-  return cachedAppToken.token;
-}
-
-async function helix(pathname, params={}) {
-  const token = await getAppToken();
-  if (!token) return null;
-  const u = new URL('https://api.twitch.tv/helix' + pathname);
-  Object.entries(params).forEach(([k,v]) => { if (v !== undefined && v !== null && v !== '') u.searchParams.append(k, v); });
-  const r = await fetch(u, { headers: { 'Client-Id': CLIENT_ID, 'Authorization': `Bearer ${token}` } });
-  if (!r.ok) throw new Error(`Twitch Helix HTTP ${r.status}`);
-  return r.json();
-}
-
-async function getTwitchEmotes(channelLogin='') {
+function loadEmotesCsv() {
+  const file = path.join(__dirname, 'emotes.csv');
+  if (!fs.existsSync(file)) return new Map();
+  const wb = XLSX.readFile(file, { cellDates: false });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   const map = new Map();
-  const add = (e) => {
-    const name = String(e?.name || '').trim();
-    const id = String(e?.id || '').trim();
-    const images = e?.images || {};
-    const url = String(images.url_2x || images.url_1x || images.url_4x || '').trim();
-    if (name && id && url && !map.has(name)) map.set(name, { code:name, url, provider:'Twitch' });
-  };
+  for (const r of rows) {
+    const type = String(r.type ?? r.Type ?? '').trim().toLowerCase();
+    const name = String(r.name ?? r.Name ?? '').trim();
+    const url = String(r.url ?? r.URL ?? r.Url ?? '').trim();
+    if (type === 'emote' && name && /^https?:\/\//i.test(url)) {
+      map.set(name, { code: name, url, provider: 'Twitch' });
+    }
+  }
+  return map;
+}
+
+const emoteMap = loadEmotesCsv();
+console.log(`Emotes carregados de emotes.csv: ${emoteMap.size}`);
+
+function addBadge(b, map) {
+  const set = String(b?.setID ?? b?.setId ?? '').trim().toLowerCase();
+  const version = String(b?.version ?? '').trim();
+  const url = String(b?.imageURL ?? b?.imageUrl ?? b?.image_url ?? '').trim();
+  if (set && version && url) map.set(`${set}:${version}`, { setId: set, version, title: b.title || set, url });
+}
+
+async function getBadges(ownerId) {
+  const map = new Map();
   try {
-    const global = await helix('/chat/emotes/global');
-    (global?.data || []).forEach(add);
-  } catch(e) { console.warn('Twitch global emotes:', e.message); }
-  if (channelLogin) {
+    const d = await gql(`query{badges{imageURL(size:DOUBLE),title,setID,version}}`);
+    (d.badges || []).forEach(b => addBadge(b, map));
+  } catch (e) { console.warn('badges:', e.message); }
+  if (ownerId) {
     try {
-      const u = await helix('/users', { login: channelLogin });
-      const broadcasterId = u?.data?.[0]?.id || '';
-      if (broadcasterId) {
-        const channel = await helix('/chat/emotes', { broadcaster_id: broadcasterId });
-        (channel?.data || []).forEach(add);
-      }
-    } catch(e) { console.warn('Twitch channel emotes:', e.message); }
+      const d = await gql(`query{user(id:${JSON.stringify(String(ownerId))}){broadcastBadges{imageURL(size:DOUBLE),title,setID,version}}}`);
+      (d.user?.broadcastBadges || []).forEach(b => addBadge(b, map));
+    } catch (e) { console.warn('channel badges:', e.message); }
   }
   return [...map.values()];
 }
 
-async function getJson(url) {
-  const r = await fetch(url, { headers: { 'User-Agent': 'Twitch-Chat-Viewer/1.0' } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
-
-function vodIdFromUrl(v) {
-  const s = String(v || '').trim();
-  const m = s.match(/(?:twitch\.tv\/videos\/|twitch\.tv\/[^/]+\/v\/)(\d+)/i) || s.match(/^(\d+)$/);
-  return m ? m[1] : '';
-}
-
-async function getVodMeta(vodId) {
-  const d = await gql(`query{video(id:"${vodId}"){id,title,createdAt,owner{id,login,displayName}}}`);
-  return d.video || {};
-}
-
-async function getAssets(ownerId, channelLogin = '') {
-  const badges = new Map();
-  const emotes = new Map();
-  const twitchEmotes = await getTwitchEmotes(channelLogin);
-  const addBadge = b => {
-    const set = String(b?.setID ?? b?.setId ?? '').trim().toLowerCase();
-    const version = String(b?.version ?? '').trim();
-    const url = String(b?.imageURL ?? b?.imageUrl ?? b?.image_url ?? '').trim();
-    if (set && version && url) badges.set(`${set}:${version}`, { setId: set, version, title: b.title || set, url });
-  };
-  try {
-    const d = await gql(`query{badges{imageURL(size:DOUBLE),title,setID,version}}`);
-    (d.badges || []).forEach(addBadge);
-  } catch(e) { console.warn('badges', e.message); }
-  if (ownerId) {
-    try {
-      const d = await gql(`query{user(id:"${ownerId}"){broadcastBadges{imageURL(size:DOUBLE),title,setID,version}}}`);
-      (d.user?.broadcastBadges || []).forEach(addBadge);
-    } catch(e) { console.warn('channel badges', e.message); }
-  }
-
-  twitchEmotes.forEach(e => emotes.set(e.code, e));
-
-  const addEmote = (code, url, provider) => {
-    if (code && url && !emotes.has(code)) emotes.set(code, { code, url, provider });
-  };
-  const tasks = [
-    getJson('https://api.betterttv.net/3/cached/emotes/global').then(a => a.forEach(e => addEmote(e.code, `https://cdn.betterttv.net/emote/${e.id}/2x`, 'BTTV'))).catch(()=>{}),
-    getJson('https://api.betterttv.net/3/cached/frankerfacez/emotes/global').then(a => a.forEach(e => addEmote(e.code, e.animated ? `https://cdn.betterttv.net/frankerfacez_emote/${e.id}/animated/2` : `https://cdn.betterttv.net/frankerfacez_emote/${e.id}/2`, 'FFZ'))).catch(()=>{}),
-    getJson('https://7tv.io/v3/emote-sets/global').then(x => (x.emotes || []).forEach(e => {
-      const f = (e.data?.host?.files || []).find(x => String(x.format).toLowerCase() === 'webp') || e.data?.host?.files?.[0];
-      if (f && e.data?.host?.url) addEmote(e.name, `https:${e.data.host.url}/2x.${f.format}`, '7TV');
-    })).catch(()=>{})
-  ];
-  if (ownerId) {
-    tasks.push(getJson(`https://api.betterttv.net/3/cached/users/twitch/${ownerId}`).then(x => { [...(x.channelEmotes || []), ...(x.sharedEmotes || [])].forEach(e => addEmote(e.code, `https://cdn.betterttv.net/emote/${e.id}/2x`, 'BTTV')); }).catch(()=>{}));
-    tasks.push(getJson(`https://api.betterttv.net/3/cached/frankerfacez/users/twitch/${ownerId}`).then(a => { a.forEach(e => addEmote(e.code, e.animated ? `https://cdn.betterttv.net/frankerfacez_emote/${e.id}/animated/2` : `https://cdn.betterttv.net/frankerfacez_emote/${e.id}/2`, 'FFZ')); }).catch(()=>{}));
-    tasks.push(getJson(`https://7tv.io/v3/users/twitch/${ownerId}`).then(async x => {
-      if (!x.emote_set_id) return;
-      const set = await getJson(`https://7tv.io/v3/emote-sets/${x.emote_set_id}`);
-      (set.emotes || []).forEach(e => {
-        const f = (e.data?.host?.files || []).find(x => String(x.format).toLowerCase() === 'webp') || e.data?.host?.files?.[0];
-        if (f && e.data?.host?.url) addEmote(e.name, `https:${e.data.host.url}/2x.${f.format}`, '7TV');
-      });
-    }).catch(()=>{}));
-  }
-  await Promise.all(tasks);
-  return { badges: [...badges.values()], emotes: [...emotes.values()] };
-}
-
 function badgeNameCandidates(name) {
   const s = String(name || '').trim().toLowerCase();
-  const m = s.match(/subscriber(?:\s+|[-_])?(\d+)?/i);
-  if (m) return [{set:'subscriber', version:m[1] || '1'}];
-  const map = {
-    moderator:'moderator', mod:'moderator', vip:'vip', broadcaster:'broadcaster', partner:'partner', founder:'founder', staff:'staff', admin:'admin', global_mod:'global_mod', turbo:'turbo', prime:'premium', premium:'premium', bits:'bits', artist:'artist'
-  };
-  const set = map[s.replace(/\s+/g,'_')];
-  return set ? [{set, version:'1'}] : [];
+  const sub = s.match(/^subscriber(?:\s+|[-_])?(\d+)?/i);
+  if (sub) return [{ set: 'subscriber', version: sub[1] || '1' }];
+  const map = { moderator:'moderator', mod:'moderator', vip:'vip', broadcaster:'broadcaster', partner:'partner', founder:'founder', staff:'staff', admin:'admin', global_mod:'global_mod', turbo:'turbo', prime:'premium', premium:'premium', bits:'bits', artist:'artist', predictions:'predictions' };
+  const set = map[s.replace(/\s+/g, '_')];
+  return set ? [{ set, version:'1' }] : [];
 }
 
 function resolveBadges(raw, badgeAssets) {
-  const names = String(raw || '').split('|').map(x=>x.trim()).filter(Boolean);
-  const out=[];
-  for (const name of names) {
+  const names = String(raw || '').split('|').map(x => x.trim()).filter(Boolean);
+  return names.map(name => {
     let found = badgeAssets.find(b => b.title.toLowerCase() === name.toLowerCase());
     if (!found) {
-      for (const c of badgeNameCandidates(name)) { found = badgeAssets.find(b => b.setId === c.set && b.version === c.version); if (found) break; }
+      for (const c of badgeNameCandidates(name)) {
+        found = badgeAssets.find(b => b.setId === c.set && b.version === c.version);
+        if (found) break;
+      }
     }
-    out.push({ name, url: found?.url || '', title: found?.title || name });
-  }
-  return out;
+    return { name, url: found?.url || '', title: found?.title || name };
+  });
 }
 
 function parseTime(v) {
@@ -168,10 +95,10 @@ function parseTime(v) {
   const s = String(v ?? '').trim();
   if (!s) return 0;
   if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
-  const m = s.match(/^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$/);
+  let m = s.match(/^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$/);
   if (m) return Number(m[1])*3600 + Number(m[2])*60 + Number(m[3]) + Number(`0.${m[4] || 0}`);
-  const m2 = s.match(/^(\d+):(\d{2})$/);
-  if (m2) return Number(m2[1])*60 + Number(m2[2]);
+  m = s.match(/^(\d+):(\d{2})$/);
+  if (m) return Number(m[1])*60 + Number(m[2]);
   return 0;
 }
 
@@ -187,32 +114,50 @@ function normalizeRow(r) {
   };
 }
 
-app.post('/api/prepare', upload.single('file'), async (req,res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error:'Envie um arquivo CSV ou Excel.' });
-    const channelLogin = String(req.body.channel || '').trim().replace(/^@/, '').toLowerCase();
-    const wb = XLSX.read(req.file.buffer, { type:'buffer', cellDates:true });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval:'' }).map(normalizeRow);
-    if (!rows.length) return res.status(400).json({ error:'Não encontrei mensagens na primeira planilha.' });
-    let channelOwner = {};
-    if (channelLogin) { try { const u = await helix('/users', {login:channelLogin}); channelOwner = u?.data?.[0] || {}; } catch(e) { console.warn('channel lookup:', e.message); } }
-    const assets = await getAssets(channelOwner.id || '', channelLogin);
-    const badgeByName = assets.badges;
-    const emoteMap = Object.fromEntries(assets.emotes.map(e => [e.code, e]));
-    const data = rows.map(x => ({ ...x, BadgeImages: resolveBadges(x.Badge, badgeByName), Parts: tokenize(x.Comment, emoteMap) }));
-    res.json({ ok:true, channel:channelOwner, comments:data, assets:{emotes:assets.emotes.length,badges:assets.badges.length}, twitchAuth:!!CLIENT_SECRET });
-  } catch(e) { console.error(e); res.status(500).json({ error:e.message || 'Erro ao processar arquivo.' }); }
-});
-
 function tokenize(text, map) {
-  const s=String(text||''); const codes=Object.keys(map).sort((a,b)=>b.length-a.length); if(!codes.length) return [{type:'text',text:s}];
-  const esc=codes.map(c=>c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')); const re=new RegExp(`(^|\\s)(${esc.join('|')})(?=$|\\s)`,'g');
-  const out=[]; let last=0,m; while((m=re.exec(s))){ if(m.index>last) out.push({type:'text',text:s.slice(last,m.index)}); if(m[1]) out.push({type:'text',text:m[1]}); out.push({type:'emote',text:m[2],url:map[m[2]].url}); last=re.lastIndex; } if(last<s.length) out.push({type:'text',text:s.slice(last)}); return out.length?out:[{type:'text',text:s}];
+  const s = String(text || '');
+  if (!map.size) return [{type:'text', text:s}];
+  const codes = [...map.keys()].sort((a,b)=>b.length-a.length);
+  const escaped = codes.map(c=>c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+  const re = new RegExp(`(^|\\s)(${escaped.join('|')})(?=$|\\s)`, 'g');
+  const out=[]; let last=0, m;
+  while ((m=re.exec(s))) {
+    if (m.index>last) out.push({type:'text',text:s.slice(last,m.index)});
+    if (m[1]) out.push({type:'text',text:m[1]});
+    const e=map.get(m[2]);
+    out.push({type:'emote',text:m[2],url:e.url});
+    last=re.lastIndex;
+  }
+  if (last<s.length) out.push({type:'text',text:s.slice(last)});
+  return out.length?out:[{type:'text',text:s}];
 }
 
-app.get('/api/image', async (req,res)=>{
-  try { const u=new URL(String(req.query.url||'')); const allowed=['static-cdn.jtvnw.net','cdn.betterttv.net','7tv.io','cdn.7tv.app','cdn.frankerfacez.com','emotes.7tv.app']; if(!allowed.includes(u.hostname)) return res.status(403).end(); const r=await fetch(u,{headers:{'User-Agent':'Twitch-Chat-Viewer/1.0'}}); if(!r.ok) return res.status(r.status).end(); res.set('Content-Type',r.headers.get('content-type')||'image/png');res.set('Cache-Control','public,max-age=86400');res.send(Buffer.from(await r.arrayBuffer())); } catch(e){res.status(502).end();}
+app.post('/api/prepare', upload.single('file'), async (req,res) => {
+  try {
+    if (!req.file) return res.status(400).json({error:'Envie um arquivo CSV ou Excel.'});
+    const wb = XLSX.read(req.file.buffer, {type:'buffer', cellDates:true});
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws,{defval:''}).map(normalizeRow);
+    if (!rows.length) return res.status(400).json({error:'Não encontrei mensagens na primeira planilha.'});
+    const badges = await getBadges('');
+    const data = rows.map(x=>({...x, BadgeImages:resolveBadges(x.Badge,badges), Parts:tokenize(x.Comment,emoteMap)}));
+    res.json({ok:true,comments:data,assets:{emotes:emoteMap.size,badges:badges.length}});
+  } catch(e) { console.error(e); res.status(500).json({error:e.message||'Erro ao processar arquivo.'}); }
 });
+
+app.get('/api/image', async (req,res)=>{
+  try {
+    const u=new URL(String(req.query.url||''));
+    const allowed=['static-cdn.jtvnw.net','cdn.betterttv.net','7tv.io','cdn.7tv.app','cdn.frankerfacez.com','emotes.7tv.app'];
+    if(!allowed.includes(u.hostname)) return res.status(403).end();
+    const r=await fetch(u,{headers:{'User-Agent':'Twitch-Chat-Viewer/3.0'}});
+    if(!r.ok) return res.status(r.status).end();
+    res.set('Content-Type',r.headers.get('content-type')||'image/png');
+    res.set('Cache-Control','public,max-age=86400');
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch(e){res.status(502).end();}
+});
+
+app.get('/api/emotes/status',(req,res)=>res.json({count:emoteMap.size,source:'emotes.csv'}));
 
 app.listen(PORT,()=>console.log(`Twitch Chat Viewer listening on ${PORT}`));
