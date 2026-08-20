@@ -7,6 +7,8 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const PORT = process.env.PORT || 10000;
 const CLIENT_ID = process.env.TWITCH_CLIENT_ID || 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET || '';
+let cachedAppToken = { token: '', expiresAt: 0 };
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -21,6 +23,53 @@ async function gql(query) {
   const d = await r.json();
   if (d.errors?.length) throw new Error(d.errors[0].message || 'Twitch GraphQL error');
   return d.data || {};
+}
+
+async function getAppToken() {
+  if (!CLIENT_SECRET) return '';
+  if (cachedAppToken.token && Date.now() < cachedAppToken.expiresAt - 60000) return cachedAppToken.token;
+  const body = new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'client_credentials' });
+  const r = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body });
+  if (!r.ok) throw new Error(`Twitch OAuth HTTP ${r.status}`);
+  const d = await r.json();
+  cachedAppToken = { token: d.access_token || '', expiresAt: Date.now() + Number(d.expires_in || 0) * 1000 };
+  return cachedAppToken.token;
+}
+
+async function helix(pathname, params={}) {
+  const token = await getAppToken();
+  if (!token) return null;
+  const u = new URL('https://api.twitch.tv/helix' + pathname);
+  Object.entries(params).forEach(([k,v]) => { if (v !== undefined && v !== null && v !== '') u.searchParams.append(k, v); });
+  const r = await fetch(u, { headers: { 'Client-Id': CLIENT_ID, 'Authorization': `Bearer ${token}` } });
+  if (!r.ok) throw new Error(`Twitch Helix HTTP ${r.status}`);
+  return r.json();
+}
+
+async function getTwitchEmotes(channelLogin='') {
+  const map = new Map();
+  const add = (e) => {
+    const name = String(e?.name || '').trim();
+    const id = String(e?.id || '').trim();
+    const images = e?.images || {};
+    const url = String(images.url_2x || images.url_1x || images.url_4x || '').trim();
+    if (name && id && url && !map.has(name)) map.set(name, { code:name, url, provider:'Twitch' });
+  };
+  try {
+    const global = await helix('/chat/emotes/global');
+    (global?.data || []).forEach(add);
+  } catch(e) { console.warn('Twitch global emotes:', e.message); }
+  if (channelLogin) {
+    try {
+      const u = await helix('/users', { login: channelLogin });
+      const broadcasterId = u?.data?.[0]?.id || '';
+      if (broadcasterId) {
+        const channel = await helix('/chat/emotes', { broadcaster_id: broadcasterId });
+        (channel?.data || []).forEach(add);
+      }
+    } catch(e) { console.warn('Twitch channel emotes:', e.message); }
+  }
+  return [...map.values()];
 }
 
 async function getJson(url) {
@@ -40,9 +89,10 @@ async function getVodMeta(vodId) {
   return d.video || {};
 }
 
-async function getAssets(ownerId) {
+async function getAssets(ownerId, channelLogin = '') {
   const badges = new Map();
   const emotes = new Map();
+  const twitchEmotes = await getTwitchEmotes(channelLogin);
   const addBadge = b => {
     const set = String(b?.setID ?? b?.setId ?? '').trim().toLowerCase();
     const version = String(b?.version ?? '').trim();
@@ -59,6 +109,8 @@ async function getAssets(ownerId) {
       (d.user?.broadcastBadges || []).forEach(addBadge);
     } catch(e) { console.warn('channel badges', e.message); }
   }
+
+  twitchEmotes.forEach(e => emotes.set(e.code, e));
 
   const addEmote = (code, url, provider) => {
     if (code && url && !emotes.has(code)) emotes.set(code, { code, url, provider });
@@ -138,18 +190,18 @@ function normalizeRow(r) {
 app.post('/api/prepare', upload.single('file'), async (req,res) => {
   try {
     if (!req.file) return res.status(400).json({ error:'Envie um arquivo CSV ou Excel.' });
-    const vodId = vodIdFromUrl(req.body.vodUrl || '');
-    if (!vodId) return res.status(400).json({ error:'Informe a URL ou ID do VOD para ativar os links de tempo e buscar badges/emotes do canal.' });
+    const channelLogin = String(req.body.channel || '').trim().replace(/^@/, '').toLowerCase();
     const wb = XLSX.read(req.file.buffer, { type:'buffer', cellDates:true });
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(ws, { defval:'' }).map(normalizeRow);
     if (!rows.length) return res.status(400).json({ error:'Não encontrei mensagens na primeira planilha.' });
-    const vod = await getVodMeta(vodId);
-    const assets = await getAssets(vod.owner?.id || '');
+    let channelOwner = {};
+    if (channelLogin) { try { const u = await helix('/users', {login:channelLogin}); channelOwner = u?.data?.[0] || {}; } catch(e) { console.warn('channel lookup:', e.message); } }
+    const assets = await getAssets(channelOwner.id || '', channelLogin);
     const badgeByName = assets.badges;
     const emoteMap = Object.fromEntries(assets.emotes.map(e => [e.code, e]));
     const data = rows.map(x => ({ ...x, BadgeImages: resolveBadges(x.Badge, badgeByName), Parts: tokenize(x.Comment, emoteMap) }));
-    res.json({ ok:true, vod:{id:vodId,title:vod.title||'',owner:vod.owner||{},createdAt:vod.createdAt||''}, comments:data, assets:{emotes:assets.emotes.length,badges:assets.badges.length} });
+    res.json({ ok:true, channel:channelOwner, comments:data, assets:{emotes:assets.emotes.length,badges:assets.badges.length}, twitchAuth:!!CLIENT_SECRET });
   } catch(e) { console.error(e); res.status(500).json({ error:e.message || 'Erro ao processar arquivo.' }); }
 });
 
