@@ -1,4 +1,4 @@
-# Twitch VOD Chat Viewer V4
+# Twitch VOD Chat Viewer V3
 
 Esta versão **não consulta mais a API da Twitch para descobrir emotes**.
 
