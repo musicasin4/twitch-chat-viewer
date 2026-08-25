@@ -35,9 +35,18 @@ function loadEmotesCsv() {
     const type = String(r.type ?? r.Type ?? '').trim().toLowerCase();
     const name = String(r.name ?? r.Name ?? '').trim();
     const url = String(r.url ?? r.URL ?? r.Url ?? '').trim();
-    if (type === 'emote' && name && /^https?:\/\//i.test(url)) {
-      map.set(name, { code: name, url, provider: 'Twitch' });
-    }
+    if (
+  (type === 'emote' || type === 'bits') &&
+  name &&
+  /^https?:\/\//i.test(url)
+) {
+  map.set(name, {
+    code: name,
+    url,
+    type,
+    provider: type === 'bits' ? 'Twitch Bits' : 'Twitch'
+  });
+}
   }
   return map;
 }
@@ -114,22 +123,145 @@ function normalizeRow(r) {
   };
 }
 
+function getBitsAmount(name) {
+  const match = String(name).match(/(\d+)$/);
+  return match ? Number(match[1]) : 0;
+}
+
+function getBitsBaseName(name) {
+  return String(name).replace(/\d+$/, '');
+}
+
+function getBitsTier(amount) {
+  if (amount >= 100000) return 100000;
+  if (amount >= 10000) return 10000;
+  if (amount >= 5000) return 5000;
+  if (amount >= 1000) return 1000;
+  if (amount >= 100) return 100;
+
+  return 1;
+}
+
+function getBitsColor(amount) {
+  if (amount >= 100000) return '#f3a71a';
+  if (amount >= 10000) return '#f43021';
+  if (amount >= 5000) return '#0099fe';
+  if (amount >= 1000) return '#1db2a5';
+  if (amount >= 100) return '#9c3ee8';
+
+  return '#979797';
+}
+
 function tokenize(text, map) {
   const s = String(text || '');
-  if (!map.size) return [{type:'text', text:s}];
-  const codes = [...map.keys()].sort((a,b)=>b.length-a.length);
-  const escaped = codes.map(c=>c.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
-  const re = new RegExp(`(^|\\s)(${escaped.join('|')})(?=$|\\s)`, 'g');
-  const out=[]; let last=0, m;
-  while ((m=re.exec(s))) {
-    if (m.index>last) out.push({type:'text',text:s.slice(last,m.index)});
-    if (m[1]) out.push({type:'text',text:m[1]});
-    const e=map.get(m[2]);
-    out.push({type:'emote',text:m[2],url:e.url});
-    last=re.lastIndex;
+
+  if (!map.size) {
+    return [{ type: 'text', text: s }];
   }
-  if (last<s.length) out.push({type:'text',text:s.slice(last)});
-  return out.length?out:[{type:'text',text:s}];
+
+  const codes = [...map.keys()].sort((a, b) => b.length - a.length);
+
+  const escaped = codes.map(code =>
+    code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  );
+
+  const re = new RegExp(
+    `(^|\\s)(${escaped.join('|')})(?=$|\\s)`,
+    'gi'
+  );
+
+  const out = [];
+  let last = 0;
+  let match;
+
+  while ((match = re.exec(s))) {
+    if (match.index > last) {
+      out.push({
+        type: 'text',
+        text: s.slice(last, match.index)
+      });
+    }
+
+    if (match[1]) {
+      out.push({
+        type: 'text',
+        text: match[1]
+      });
+    }
+
+    const code = match[2];
+
+    const data =
+      map.get(code) ||
+      map.get(
+        [...map.keys()].find(
+          key => key.toLowerCase() === code.toLowerCase()
+        )
+      );
+
+    if (!data) {
+      out.push({
+        type: 'text',
+        text: code
+      });
+
+      last = re.lastIndex;
+      continue;
+    }
+
+    if (data.type === 'bits') {
+  const amount = getBitsAmount(data.code);
+
+  const baseName = getBitsBaseName(data.code);
+
+  const tier = getBitsTier(amount);
+
+  // Procura a imagem correspondente à faixa do bit.
+  // Exemplo:
+  // Cheer99 -> Cheer1
+  // Cheer100 -> Cheer100
+  // Cheer1000 -> Cheer1000
+  const imageName = `${baseName}${tier}`;
+
+  const imageData =
+    map.get(imageName) ||
+    map.get(
+      [...map.keys()].find(
+        key => key.toLowerCase() === imageName.toLowerCase()
+      )
+    );
+
+  out.push({
+    type: 'bits',
+    text: data.code,
+    amount,
+    color: getBitsColor(amount),
+    url: imageData?.url || data.url
+  });
+}
+}olor: getBitsColor(amount)
+      });
+    } else {
+      out.push({
+        type: 'emote',
+        text: code,
+        url: data.url
+      });
+    }
+
+    last = re.lastIndex;
+  }
+
+  if (last < s.length) {
+    out.push({
+      type: 'text',
+      text: s.slice(last)
+    });
+  }
+
+  return out.length
+    ? out
+    : [{ type: 'text', text: s }];
 }
 
 app.post('/api/prepare', upload.single('file'), async (req,res) => {
