@@ -24,34 +24,36 @@ async function gql(query) {
   return d.data || {};
 }
 
-function loadEmotesCsv() {
+function loadChatAssetsCsv() {
   const file = path.join(__dirname, 'emotes.csv');
-  if (!fs.existsSync(file)) return new Map();
+  const emotes = new Map();
+  const bits = new Map();
+  if (!fs.existsSync(file)) return { emotes, bits };
   const wb = XLSX.readFile(file, { cellDates: false });
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-  const map = new Map();
   for (const r of rows) {
     const type = String(r.type ?? r.Type ?? '').trim().toLowerCase();
     const name = String(r.name ?? r.Name ?? '').trim();
     const url = String(r.url ?? r.URL ?? r.Url ?? '').trim();
-    if (
-  (type === 'emote' || type === 'bits') &&
-  name &&
-  /^https?:\/\//i.test(url)
-) {
-  map.set(name, {
-    code: name,
-    url,
-    type,
-    provider: type === 'bits' ? 'Twitch Bits' : 'Twitch'
-  });
-}
+    if (!name || !/^https?:\/\//i.test(url)) continue;
+    if (type === 'emote') {
+      emotes.set(name, { code: name, url, provider: 'Twitch' });
+    } else if (type === 'bits') {
+      // In the CSV, names such as cheer1, cheerwhal1, Corgo1 mean the 1-bit form.
+      // The trailing 1 is the base asset; the viewer changes the URL path for the tier.
+      const baseName = name.replace(/1$/, '').toLowerCase();
+      if (baseName) bits.set(baseName, { code: baseName, sourceName: name, url, provider: 'Twitch Bits' });
+    }
   }
-  return map;
+  return { emotes, bits };
 }
 
-const emoteMap = loadEmotesCsv();
+const chatAssets = loadChatAssetsCsv();
+const emoteMap = chatAssets.emotes;
+const bitsMap = chatAssets.bits;
+console.log(`Emotes carregados de emotes.csv: ${emoteMap.size}`);
+console.log(`Tipos de bits carregados de emotes.csv: ${bitsMap.size}`);
 console.log(`Emotes carregados de emotes.csv: ${emoteMap.size}`);
 
 function addBadge(b, map) {
@@ -123,147 +125,54 @@ function normalizeRow(r) {
   };
 }
 
-function getBitsAmount(name) {
-  const match = String(name).match(/(\d+)$/);
-  return match ? Number(match[1]) : 0;
-}
-
-function getBitsBaseName(name) {
-  return String(name).replace(/\d+$/, '');
-}
-
-function getBitsTier(amount) {
+const BIT_TIERS = [1, 100, 1000, 5000, 10000, 100000];
+function bitTier(amount) {
   if (amount >= 100000) return 100000;
   if (amount >= 10000) return 10000;
   if (amount >= 5000) return 5000;
   if (amount >= 1000) return 1000;
   if (amount >= 100) return 100;
-
   return 1;
 }
-
-function getBitsColor(amount) {
+function bitColor(amount) {
   if (amount >= 100000) return '#f3a71a';
   if (amount >= 10000) return '#f43021';
   if (amount >= 5000) return '#0099fe';
   if (amount >= 1000) return '#1db2a5';
   if (amount >= 100) return '#9c3ee8';
-
   return '#979797';
 }
-
-function tokenize(text, map) {
+function bitUrl(baseUrl, tier) {
+  // Twitch Bits animation URLs use /animated/{amount}/3.gif.
+  return String(baseUrl).replace(/(\/animated\/)\d+(\/)/i, `$1${tier}$2`);
+}
+function findBitToken(token, bits) {
+  const m = String(token || '').match(/^(.+?)(\d+)$/);
+  if (!m) return null;
+  const base = m[1].toLowerCase();
+  const amount = Number(m[2]);
+  if (!Number.isFinite(amount) || amount < 1) return null;
+  const asset = bits.get(base);
+  if (!asset) return null;
+  const tier = bitTier(Math.min(amount, 100000));
+  return { type: 'bits', text: token, amount: Math.min(amount, 100000), url: bitUrl(asset.url, tier), color: bitColor(Math.min(amount, 100000)), tier };
+}
+function tokenize(text, emotes, bits) {
   const s = String(text || '');
-
-  if (!map.size) {
-    return [{ type: 'text', text: s }];
+  const out=[];
+  // Tokenize by whitespace so both emotes and cheer words remain intact.
+  const chunks = s.split(/(\s+)/);
+  for (const chunk of chunks) {
+    if (!chunk) continue;
+    if (/^\s+$/.test(chunk)) { out.push({type:'text', text:chunk}); continue; }
+    const bit = findBitToken(chunk, bits);
+    if (bit) { out.push(bit); continue; }
+    const e = emotes.get(chunk) || emotes.get([...emotes.keys()].find(k => k.toLowerCase() === chunk.toLowerCase()));
+    if (e) out.push({type:'emote',text:chunk,url:e.url});
+    else out.push({type:'text',text:chunk});
   }
-
-  const codes = [...map.keys()].sort((a, b) => b.length - a.length);
-
-  const escaped = codes.map(code =>
-    code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  );
-
-  const re = new RegExp(
-    `(^|\\s)(${escaped.join('|')})(?=$|\\s)`,
-    'gi'
-  );
-
-  const out = [];
-  let last = 0;
-  let match;
-
-  while ((match = re.exec(s))) {
-    if (match.index > last) {
-      out.push({
-        type: 'text',
-        text: s.slice(last, match.index)
-      });
-    }
-
-    if (match[1]) {
-      out.push({
-        type: 'text',
-        text: match[1]
-      });
-    }
-
-    const code = match[2];
-
-    const data =
-      map.get(code) ||
-      map.get(
-        [...map.keys()].find(
-          key => key.toLowerCase() === code.toLowerCase()
-        )
-      );
-
-    if (!data) {
-      out.push({
-        type: 'text',
-        text: code
-      });
-
-      last = re.lastIndex;
-      continue;
-    }
-
-    if (data.type === 'bits') {
-  const amount = getBitsAmount(data.code);
-
-  const baseName = getBitsBaseName(data.code);
-
-  const tier = getBitsTier(amount);
-
-  // Procura a imagem correspondente à faixa do bit.
-  // Exemplo:
-  // Cheer99 -> Cheer1
-  // Cheer100 -> Cheer100
-  // Cheer1000 -> Cheer1000
-  const imageName = `${baseName}${tier}`;
-
-  const imageData =
-    map.get(imageName) ||
-    map.get(
-      [...map.keys()].find(
-        key => key.toLowerCase() === imageName.toLowerCase()
-      )
-    );
-
-  out.push({
-    type: 'bits',
-    text: data.code,
-    amount,
-    color: getBitsColor(amount),
-    url: imageData?.url || data.url
-  });
+  return out.length ? out : [{type:'text',text:s}];
 }
-}olor: getBitsColor(amount)
-      });
-    } else {
-      out.push({
-        type: 'emote',
-        text: code,
-        url: data.url
-      });
-    }
-
-    last = re.lastIndex;
-  }
-
-  if (last < s.length) {
-    out.push({
-      type: 'text',
-      text: s.slice(last)
-    });
-  }
-
-  return out.length
-    ? out
-    : [{ type: 'text', text: s }];
-}
-
 app.post('/api/prepare', upload.single('file'), async (req,res) => {
   try {
     if (!req.file) return res.status(400).json({error:'Envie um arquivo CSV ou Excel.'});
@@ -272,8 +181,8 @@ app.post('/api/prepare', upload.single('file'), async (req,res) => {
     const rows = XLSX.utils.sheet_to_json(ws,{defval:''}).map(normalizeRow);
     if (!rows.length) return res.status(400).json({error:'Não encontrei mensagens na primeira planilha.'});
     const badges = await getBadges('');
-    const data = rows.map(x=>({...x, BadgeImages:resolveBadges(x.Badge,badges), Parts:tokenize(x.Comment,emoteMap)}));
-    res.json({ok:true,comments:data,assets:{emotes:emoteMap.size,badges:badges.length}});
+    const data = rows.map(x=>({...x, BadgeImages:resolveBadges(x.Badge,badges), Parts:tokenize(x.Comment,emoteMap,bitsMap)}));
+    res.json({ok:true,comments:data,assets:{emotes:emoteMap.size,bits:bitsMap.size,badges:badges.length}});
   } catch(e) { console.error(e); res.status(500).json({error:e.message||'Erro ao processar arquivo.'}); }
 });
 
