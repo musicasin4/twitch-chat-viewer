@@ -31,3 +31,7 @@ As cores do número seguem a Twitch:
 - 100000: `#f3a71a`
 
 Emotes continuam com 28×28 px. O tempo não é clicável e não exige URL de VOD.
+
+
+### Bits V6
+Linhas `bits,Nome100,...` também são aceitas. A URL da linha é usada como origem e o tier é ajustado mantendo o caminho da ação. O domínio CloudFront dos Bits está liberado no proxy.

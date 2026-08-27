@@ -32,23 +32,41 @@ function loadChatAssetsCsv() {
   const wb = XLSX.readFile(file, { cellDates: false });
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+  // Bit names can be stored as cheer1, ShowLove1, ShowLove100, etc.
+  // The trailing number is the bit tier, not part of the cheer type.
+  const tiers = [100000, 10000, 5000, 1000, 100, 1];
   for (const r of rows) {
     const type = String(r.type ?? r.Type ?? '').trim().toLowerCase();
     const name = String(r.name ?? r.Name ?? '').trim();
     const url = String(r.url ?? r.URL ?? r.Url ?? '').trim();
     if (!name || !/^https?:\/\//i.test(url)) continue;
+
     if (type === 'emote') {
       emotes.set(name, { code: name, url, provider: 'Twitch' });
     } else if (type === 'bits') {
-      // In the CSV, names such as cheer1, cheerwhal1, Corgo1 mean the 1-bit form.
-      // The trailing 1 is the base asset; the viewer changes the URL path for the tier.
-      const baseName = name.replace(/1$/, '').toLowerCase();
-      if (baseName) bits.set(baseName, { code: baseName, sourceName: name, url, provider: 'Twitch Bits' });
+      let baseName = name;
+      let tier = 1;
+      for (const candidate of tiers) {
+        if (baseName.toLowerCase().endsWith(String(candidate))) {
+          baseName = baseName.slice(0, -String(candidate).length);
+          tier = candidate;
+          break;
+        }
+      }
+      baseName = baseName.trim().toLowerCase();
+      if (!baseName) continue;
+
+      let entry = bits.get(baseName);
+      if (!entry) {
+        entry = { code: baseName, tiers: new Map(), provider: 'Twitch Bits' };
+        bits.set(baseName, entry);
+      }
+      entry.tiers.set(tier, { sourceName: name, url });
     }
   }
   return { emotes, bits };
 }
-
 const chatAssets = loadChatAssetsCsv();
 const emoteMap = chatAssets.emotes;
 const bitsMap = chatAssets.bits;
@@ -143,7 +161,7 @@ function bitColor(amount) {
   return '#979797';
 }
 function bitUrl(baseUrl, tier) {
-  // Twitch Bits animation URLs use /animated/{amount}/3.gif.
+  // Keep the cheer action (cheer/showlove/etc.) from the CSV and only change the tier.
   return String(baseUrl).replace(/(\/animated\/)\d+(\/)/i, `$1${tier}$2`);
 }
 function findBitToken(token, bits) {
@@ -152,10 +170,27 @@ function findBitToken(token, bits) {
   const base = m[1].toLowerCase();
   const amount = Number(m[2]);
   if (!Number.isFinite(amount) || amount < 1) return null;
+
   const asset = bits.get(base);
   if (!asset) return null;
-  const tier = bitTier(Math.min(amount, 100000));
-  return { type: 'bits', text: token, amount: Math.min(amount, 100000), url: bitUrl(asset.url, tier), color: bitColor(Math.min(amount, 100000)), tier };
+
+  const normalizedAmount = Math.min(amount, 100000);
+  const tier = bitTier(normalizedAmount);
+  // Prefer an exact tier row when the CSV has one; otherwise derive the tier
+  // from any available row for that cheer type while preserving its action path.
+  const exact = asset.tiers.get(tier);
+  const fallback = asset.tiers.get(1) || asset.tiers.values().next().value;
+  const source = exact || fallback;
+  if (!source) return null;
+
+  return {
+    type: 'bits',
+    text: token,
+    amount: normalizedAmount,
+    url: bitUrl(source.url, tier),
+    color: bitColor(normalizedAmount),
+    tier
+  };
 }
 function tokenize(text, emotes, bits) {
   const s = String(text || '');
@@ -189,7 +224,7 @@ app.post('/api/prepare', upload.single('file'), async (req,res) => {
 app.get('/api/image', async (req,res)=>{
   try {
     const u=new URL(String(req.query.url||''));
-    const allowed=['static-cdn.jtvnw.net','cdn.betterttv.net','7tv.io','cdn.7tv.app','cdn.frankerfacez.com','emotes.7tv.app'];
+    const allowed=['static-cdn.jtvnw.net','d3aqoihi2n8ty8.cloudfront.net','cdn.betterttv.net','7tv.io','cdn.7tv.app','cdn.frankerfacez.com','emotes.7tv.app'];
     if(!allowed.includes(u.hostname)) return res.status(403).end();
     const r=await fetch(u,{headers:{'User-Agent':'Twitch-Chat-Viewer/3.0'}});
     if(!r.ok) return res.status(r.status).end();
